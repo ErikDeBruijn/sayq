@@ -1,0 +1,132 @@
+#!/bin/bash
+# say-queued: Speak text with collision prevention and cooldown
+#
+# Prevents multiple Claude/AI sessions from talking over each other using
+# mkdir-based mutual exclusion (atomic on all filesystems).
+# Waits for any running say process, enforces a cooldown, and detects
+# MacWhisper transcription activity.
+# Supports Escape/Ctrl+C interruption.
+#
+# Usage:
+#   say-queued "text to speak"
+#   say-queued                    # reads from /tmp/claude-say.txt
+#   cat file.txt | say-queued -   # reads from stdin
+
+LOCK_DIR="/tmp/say-queued.lock.d"
+TIMESTAMP_FILE="/tmp/say-queued.timestamp"
+CALLER_FILE="/tmp/say-queued.caller"
+TEXT_FILE="/tmp/claude-say.txt"
+COOLDOWN=5
+MACWHISPER_CPU_THRESHOLD=15
+MACWHISPER_SETTLE_SECONDS=3
+STALE_LOCK_SECONDS=120
+
+# Get text to speak before acquiring lock
+if [ $# -gt 0 ] && [ "$1" != "-" ]; then
+    TEXT="$*"
+elif [ "$1" = "-" ]; then
+    TEXT=$(cat)
+elif [ -f "$TEXT_FILE" ]; then
+    TEXT=$(cat "$TEXT_FILE")
+else
+    exit 1
+fi
+
+[ -z "$TEXT" ] && exit 1
+
+# Forward signals to say process and release lock on exit
+SAY_PID=""
+cleanup() {
+    [ -n "$SAY_PID" ] && kill "$SAY_PID" 2>/dev/null
+    rm -rf "$LOCK_DIR" 2>/dev/null
+    exit 0
+}
+trap cleanup INT TERM EXIT
+
+# Check if MacWhisper is actively transcribing (CPU > threshold)
+macwhisper_is_active() {
+    local pid
+    pid=$(pgrep -x MacWhisper 2>/dev/null | head -1)
+    [ -z "$pid" ] && return 1
+    local cpu
+    cpu=$(ps -p "$pid" -o %cpu= 2>/dev/null | tr -d ' ')
+    [ -z "$cpu" ] && return 1
+    local cpu_int=${cpu%%.*}
+    [ "$cpu_int" -ge "$MACWHISPER_CPU_THRESHOLD" ]
+}
+
+wait_for_macwhisper() {
+    if macwhisper_is_active; then
+        while macwhisper_is_active; do
+            sleep 1
+        done
+        sleep "$MACWHISPER_SETTLE_SECONDS"
+    fi
+}
+
+# Wait for any say or afplay process (afplay used by say-tts for Chatterbox audio)
+wait_for_say() {
+    while pgrep -x "say|afplay" > /dev/null 2>&1; do
+        sleep 0.5
+    done
+}
+
+# Acquire exclusive lock. Steals the lock immediately if the holder process is dead
+# or the lock is older than STALE_LOCK_SECONDS.
+acquire_lock() {
+    while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+        # Steal lock if holder is no longer alive
+        if [ -f "$LOCK_DIR/pid" ]; then
+            HOLDER=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+            if [ -n "$HOLDER" ] && ! kill -0 "$HOLDER" 2>/dev/null; then
+                rm -rf "$LOCK_DIR" 2>/dev/null
+                continue
+            fi
+        fi
+        # Steal lock if it has gone stale (no pid file, or very old)
+        LOCK_AGE=$(( $(date +%s) - $(stat -f %m "$LOCK_DIR" 2>/dev/null || echo 0) ))
+        if [ "$LOCK_AGE" -gt "$STALE_LOCK_SECONDS" ]; then
+            rm -rf "$LOCK_DIR" 2>/dev/null
+            continue
+        fi
+        sleep 1
+    done
+    echo $$ > "$LOCK_DIR/pid"
+}
+
+acquire_lock
+
+# --- CRITICAL SECTION: only one say-queued runs from here ---
+
+# Wait for any say process (from sessions not using say-queued)
+wait_for_say
+
+# Wait for cooldown since last say finished
+if [ -f "$TIMESTAMP_FILE" ]; then
+    LAST_FINISHED=$(cat "$TIMESTAMP_FILE" 2>/dev/null || echo 0)
+    NOW=$(date +%s)
+    ELAPSED=$((NOW - LAST_FINISHED))
+    if [ "$ELAPSED" -lt "$COOLDOWN" ]; then
+        REMAINING=$((COOLDOWN - ELAPSED))
+        sleep "$REMAINING"
+    fi
+fi
+
+# Wait for MacWhisper transcription to finish
+wait_for_macwhisper
+
+# Final check for stray say processes
+wait_for_say
+
+# Speak via Chatterbox TTS (with macOS say fallback)
+# Escape/Ctrl+C can interrupt via signal trap
+say-tts "$TEXT" &
+SAY_PID=$!
+wait "$SAY_PID" 2>/dev/null
+SAY_PID=""
+
+# Record when we finished speaking and who spoke
+date +%s > "$TIMESTAMP_FILE"
+echo "$MY_CALLER" > "$CALLER_FILE"
+
+# Lock released by EXIT trap (rm -rf)

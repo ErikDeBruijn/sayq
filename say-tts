@@ -1,0 +1,98 @@
+#!/bin/bash
+# say-tts: Text-to-speech with quality upgrade for short texts
+#
+# Short texts (≤3000 chars): Chatterbox TTS API (better quality), macOS say fallback
+# Long texts (>3000 chars): macOS say directly (no chunking complexity)
+#
+# Includes MacWhisper check before playback to avoid talking over the user.
+#
+# Usage:
+#   say-tts "text to speak"
+#   echo "text" | say-tts -
+
+TTS_HOST="${TTS_HOST:-ollama.home}"
+TTS_PORT="${TTS_PORT:-8880}"
+TTS_VOICE="${TTS_VOICE:-dutch}"
+TTS_URL="http://${TTS_HOST}:${TTS_PORT}/v1/audio/speech"
+MACWHISPER_CPU_THRESHOLD=15
+MACWHISPER_SETTLE_SECONDS=3
+CHATTERBOX_MAX_CHARS=3000
+
+# Get text
+if [ $# -gt 0 ] && [ "$1" != "-" ]; then
+    TEXT="$*"
+elif [ "$1" = "-" ]; then
+    TEXT=$(cat)
+else
+    echo "Usage: say-tts \"text to speak\"" >&2
+    exit 1
+fi
+
+[ -z "$TEXT" ] && exit 1
+
+# Check if MacWhisper is actively transcribing (CPU > threshold)
+macwhisper_is_active() {
+    local pid
+    pid=$(pgrep -x MacWhisper 2>/dev/null | head -1)
+    [ -z "$pid" ] && return 1
+    local cpu
+    cpu=$(ps -p "$pid" -o %cpu= 2>/dev/null | tr -d ' ')
+    [ -z "$cpu" ] && return 1
+    local cpu_int=${cpu%%.*}
+    [ "$cpu_int" -ge "$MACWHISPER_CPU_THRESHOLD" ]
+}
+
+# Wait for MacWhisper to finish transcribing before playing audio
+wait_for_macwhisper() {
+    if macwhisper_is_active; then
+        while macwhisper_is_active; do
+            sleep 1
+        done
+        sleep "$MACWHISPER_SETTLE_SECONDS"
+    fi
+}
+
+# macOS say (always works, any length)
+macos_speak() {
+    wait_for_macwhisper
+    say -v Xander "$TEXT" &
+    local pid=$!
+    wait "$pid" 2>/dev/null
+}
+
+# Try Chatterbox TTS for short texts (better quality)
+chatterbox_speak() {
+    local wav="/tmp/say-tts-$$.wav"
+    trap "rm -f '$wav'" EXIT
+
+    local json_payload
+    json_payload=$(jq -n \
+        --arg input "$TEXT" \
+        --arg voice "$TTS_VOICE" \
+        '{model:"chatterbox", input:$input, voice:$voice, response_format:"wav"}')
+
+    local http_code
+    http_code=$(curl -s -o "$wav" -w "%{http_code}" \
+        --connect-timeout 5 --max-time 120 \
+        -X POST "$TTS_URL" \
+        -H "Content-Type: application/json" \
+        -d "$json_payload" \
+        2>/dev/null)
+
+    if [ "$http_code" = "200" ] && [ -s "$wav" ]; then
+        wait_for_macwhisper
+        afplay "$wav" &
+        local pid=$!
+        wait "$pid" 2>/dev/null
+        return 0
+    fi
+    return 1
+}
+
+# Short text: try Chatterbox (upgrade), fall back to macOS say
+# Long text: macOS say directly
+if [ ${#TEXT} -le "$CHATTERBOX_MAX_CHARS" ]; then
+    chatterbox_speak || macos_speak
+else
+    macos_speak
+fi
