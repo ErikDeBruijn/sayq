@@ -60,8 +60,17 @@ macos_speak() {
     wait "$pid" 2>/dev/null
 }
 
+# Quick health check: is the Chatterbox server responding at all?
+chatterbox_alive() {
+    curl -s -o /dev/null -w "%{http_code}" \
+        --connect-timeout 2 --max-time 3 \
+        "$TTS_URL" 2>/dev/null | grep -qv "^000$"
+}
+
 # Try Chatterbox TTS for short texts (better quality)
 chatterbox_speak() {
+    chatterbox_alive || return 1
+
     local wav="/tmp/say-tts-$$.wav"
     trap "rm -f '$wav'" EXIT
 
@@ -73,7 +82,7 @@ chatterbox_speak() {
 
     local http_code
     http_code=$(curl -s -o "$wav" -w "%{http_code}" \
-        --connect-timeout 5 --max-time 120 \
+        --connect-timeout 5 --max-time 30 \
         -X POST "$TTS_URL" \
         -H "Content-Type: application/json" \
         -d "$json_payload" \
