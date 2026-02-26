@@ -10,7 +10,7 @@
 #   say-tts "text to speak"
 #   echo "text" | say-tts -
 
-TTS_HOST="${TTS_HOST:-ollama.home}"
+TTS_HOST="${TTS_HOST:-ollama.local}"
 TTS_PORT="${TTS_PORT:-8880}"
 TTS_VOICE="${TTS_VOICE:-dutch}"
 TTS_URL="http://${TTS_HOST}:${TTS_PORT}/v1/audio/speech"
