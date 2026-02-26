@@ -10,13 +10,14 @@
 #   say-tts "text to speak"
 #   echo "text" | say-tts -
 
-TTS_HOST="${TTS_HOST:-ollama.local}"
+TTS_HOST="${TTS_HOST:-ollama.home}"
 TTS_PORT="${TTS_PORT:-8880}"
 TTS_VOICE="${TTS_VOICE:-dutch}"
 TTS_URL="http://${TTS_HOST}:${TTS_PORT}/v1/audio/speech"
 MACWHISPER_CPU_THRESHOLD=15
 MACWHISPER_SETTLE_SECONDS=3
 CHATTERBOX_MAX_CHARS=3000
+LOG_FILE="/tmp/say-tts.log"
 
 # Get text
 if [ $# -gt 0 ] && [ "$1" != "-" ]; then
@@ -29,6 +30,12 @@ else
 fi
 
 [ -z "$TEXT" ] && exit 1
+
+log() {
+    echo "$(date '+%H:%M:%S') $*" >> "$LOG_FILE"
+}
+
+log "--- say-tts start: ${#TEXT} chars, url=$TTS_URL"
 
 # Check if MacWhisper is actively transcribing (CPU > threshold)
 macwhisper_is_active() {
@@ -45,31 +52,42 @@ macwhisper_is_active() {
 # Wait for MacWhisper to finish transcribing before playing audio
 wait_for_macwhisper() {
     if macwhisper_is_active; then
+        log "waiting for MacWhisper..."
         while macwhisper_is_active; do
             sleep 1
         done
         sleep "$MACWHISPER_SETTLE_SECONDS"
+        log "MacWhisper settled"
     fi
 }
 
 # macOS say (always works, any length)
 macos_speak() {
+    log "using macOS say (voice: Xander)"
     wait_for_macwhisper
     say -v Xander "$TEXT" &
     local pid=$!
     wait "$pid" 2>/dev/null
+    log "macOS say done"
 }
 
 # Quick health check: is the Chatterbox server responding at all?
 chatterbox_alive() {
-    curl -s -o /dev/null -w "%{http_code}" \
+    local code
+    code=$(curl -s -o /dev/null -w "%{http_code}" \
         --connect-timeout 2 --max-time 3 \
-        "$TTS_URL" 2>/dev/null | grep -qv "^000$"
+        "$TTS_URL" 2>/dev/null)
+    log "health check -> http=$code"
+    [ "$code" != "000" ]
 }
 
 # Try Chatterbox TTS for short texts (better quality)
 chatterbox_speak() {
-    chatterbox_alive || return 1
+    log "trying Chatterbox..."
+    if ! chatterbox_alive; then
+        log "Chatterbox unreachable, skipping"
+        return 1
+    fi
 
     local wav="/tmp/say-tts-$$.wav"
     trap "rm -f '$wav'" EXIT
@@ -80,6 +98,8 @@ chatterbox_speak() {
         --arg voice "$TTS_VOICE" \
         '{model:"chatterbox", input:$input, voice:$voice, response_format:"wav"}')
 
+    log "POST $TTS_URL voice=$TTS_VOICE"
+    local t0=$SECONDS
     local http_code
     http_code=$(curl -s -o "$wav" -w "%{http_code}" \
         --connect-timeout 5 --max-time 30 \
@@ -87,14 +107,22 @@ chatterbox_speak() {
         -H "Content-Type: application/json" \
         -d "$json_payload" \
         2>/dev/null)
+    local elapsed=$(( SECONDS - t0 ))
+    local wav_size=0
+    [ -f "$wav" ] && wav_size=$(wc -c < "$wav" | tr -d ' ')
+    log "response: http=$http_code size=${wav_size}b time=${elapsed}s"
 
     if [ "$http_code" = "200" ] && [ -s "$wav" ]; then
         wait_for_macwhisper
+        log "playing via afplay"
         afplay "$wav" &
         local pid=$!
         wait "$pid" 2>/dev/null
+        log "afplay done"
         return 0
     fi
+
+    log "Chatterbox failed (http=$http_code size=${wav_size}b), falling back"
     return 1
 }
 
@@ -103,5 +131,8 @@ chatterbox_speak() {
 if [ ${#TEXT} -le "$CHATTERBOX_MAX_CHARS" ]; then
     chatterbox_speak || macos_speak
 else
+    log "text too long (${#TEXT} > $CHATTERBOX_MAX_CHARS), using macOS say directly"
     macos_speak
 fi
+
+log "--- say-tts done"
